@@ -76,86 +76,389 @@ pre.code{background:#0f172a;color:#e2e8f0;padding:12px;border-radius:10px;overfl
 <body>
 <div id="app"></div><div id="modal"></div><div id="toasts"></div>
 <script>
-/* SHA-256 puro (sin dependencias) + derivación iterada de contraseña */
-function sha256(str){
-  var enc=new TextEncoder().encode(str),l=enc.length,K=[],H=[],i,j,p=2,n=0;
-  function isP(x){for(var d=2;d*d<=x;d++)if(x%d===0)return false;return true}
-  while(n<64){if(isP(p)){K[n]=(Math.pow(p,1/3)%1)*4294967296|0;if(n<8)H[n]=(Math.pow(p,1/2)%1)*4294967296|0;n++}p++}
-  var tl=((l+9+63)>>6)<<6,b=new Uint8Array(tl);b.set(enc);b[l]=0x80;
-  var dv=new DataView(b.buffer);dv.setUint32(tl-8,Math.floor(l*8/4294967296));dv.setUint32(tl-4,(l*8)>>>0);
-  var w=new Array(64);
-  for(var o=0;o<tl;o+=64){
-    for(i=0;i<16;i++)w[i]=dv.getUint32(o+i*4);
-    for(i=16;i<64;i++){
-      var a1=w[i-15],a2=w[i-2];
-      var s0=((a1>>>7)|(a1<<25))^((a1>>>18)|(a1<<14))^(a1>>>3);
-      var s1=((a2>>>17)|(a2<<15))^((a2>>>19)|(a2<<13))^(a2>>>10);
-      w[i]=(w[i-16]+s0+w[i-7]+s1)|0;
-    }
-    var a=H[0],bb=H[1],c=H[2],d=H[3],e=H[4],f=H[5],g=H[6],h=H[7];
-    for(j=0;j<64;j++){
-      var S1=((e>>>6)|(e<<26))^((e>>>11)|(e<<21))^((e>>>25)|(e<<7));
-      var ch=(e&f)^(~e&g);
-      var t1=(h+S1+ch+K[j]+w[j])|0;
-      var S0=((a>>>2)|(a<<30))^((a>>>13)|(a<<19))^((a>>>22)|(a<<10));
-      var mj=(a&bb)^(a&c)^(bb&c);
-      var t2=(S0+mj)|0;
-      h=g;g=f;f=e;e=(d+t1)|0;d=c;c=bb;bb=a;a=(t1+t2)|0;
-    }
-    H[0]=(H[0]+a)|0;H[1]=(H[1]+bb)|0;H[2]=(H[2]+c)|0;H[3]=(H[3]+d)|0;
-    H[4]=(H[4]+e)|0;H[5]=(H[5]+f)|0;H[6]=(H[6]+g)|0;H[7]=(H[7]+h)|0;
-  }
-  return H.map(function(x){return ('00000000'+(x>>>0).toString(16)).slice(-8)}).join('');
-}
-function hashPw(pw,salt){var h=sha256(salt+':'+pw);for(var i=0;i<15000;i++)h=sha256(h+salt+pw);return h}
 
 var GAS_CODE=String.raw`/**
- * StockPulse - Backend Google Apps Script (v2, con token y sincronización bidireccional)
- * Guarda el estado completo en la hoja ESTADO_JSON y deja hojas legibles para reportes.
+ * StockPulse - Backend Google Apps Script v4 (autenticación y autorización en el servidor)
+ *
+ * - Usuarios y hashes en la hoja oculta _AUTH. La clave secreta (PEPPER) vive en Propiedades del script,
+ *   NUNCA en la hoja: con la hoja filtrada los hashes no se pueden atacar.
+ * - Login valida usuario/contraseña aquí y devuelve una sesión firmada (12 h).
+ * - Todas las demás acciones exigen sesión y validan el ROL en el servidor.
+ * - El navegador solo necesita la URL de la Web App.
+ *
+ * INSTALACIÓN: 1) pegue este código  2) ejecute la función instalar() y copie la contraseña del admin
+ * desde Ver > Registros de ejecución  3) Implementar > Nueva implementación > Aplicación web
+ * (Ejecutar como: Yo / Acceso: Cualquier usuario)  4) copie la URL /exec en el index.html.
  */
-var TOKEN = 'CAMBIE-ESTE-TOKEN-POR-UNA-CLAVE-LARGA';
+var VERSION = '4.0';
+var TOKEN_TTL_MS = 12 * 60 * 60 * 1000;
+var ROUNDS = 300;
+var AUTH_HEADERS = ['id', 'username', 'name', 'email', 'role', 'cargo', 'active', 'mustChange', 'salt', 'hash', 'updatedAt', 'deleted'];
+var ROLES = ['ADMIN', 'SUPERVISOR', 'OPERARIO', 'CONSULTOR'];
 
-function json_(o) {
-  return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON);
+/* ---------- utilidades ---------- */
+function json_(o) { return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
+function getSS_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (ss) return ss;
+  var props = PropertiesService.getScriptProperties();
+  var id = props.getProperty('SS_ID');
+  if (id) { try { return SpreadsheetApp.openById(id); } catch (e) {} }
+  ss = SpreadsheetApp.create('StockPulse - Inventarios');
+  props.setProperty('SS_ID', ss.getId());
+  return ss;
 }
-function doGet() { return json_({ ok: true, service: 'StockPulse Apps Script API v2' }); }
+function sheet_(ss, name) { return ss.getSheetByName(name) || ss.insertSheet(name); }
+function now_() { return Utilities.formatDate(new Date(), 'America/Bogota', 'yyyy-MM-dd HH:mm:ss'); }
+function pepper_() {
+  var props = PropertiesService.getScriptProperties();
+  var p = props.getProperty('PEPPER');
+  if (!p) { p = Utilities.getUuid() + Utilities.getUuid() + Utilities.getUuid(); props.setProperty('PEPPER', p); }
+  return p;
+}
+function hex_(bytes) {
+  var s = '';
+  for (var i = 0; i < bytes.length; i++) { var b = bytes[i] < 0 ? bytes[i] + 256 : bytes[i]; s += (b < 16 ? '0' : '') + b.toString(16); }
+  return s;
+}
+function hash_(pw, salt) {
+  var key = pepper_(), h = salt + ':' + pw;
+  for (var i = 0; i < ROUNDS; i++) h = hex_(Utilities.computeHmacSha256Signature(h + salt, key));
+  return h;
+}
+function safeEq_(a, b) {
+  a = String(a); b = String(b);
+  if (a.length !== b.length) return false;
+  var r = 0;
+  for (var i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return r === 0;
+}
+function newSalt_() { return (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, ''); }
+function randPw_() {
+  var a = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
+  var u = (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, ''), s = '';
+  for (var i = 0; i < 14; i++) s += a.charAt(parseInt(u.substr(i * 2, 2), 16) % a.length);
+  return s + '7';
+}
+function trim_(s) { return String(s == null ? '' : s).replace(/^\s+|\s+$/g, ''); }
+function pwOk_(p) { return typeof p === 'string' && p.length >= 8 && p === trim_(p) && /[A-Za-z]/.test(p) && /\d/.test(p); }
+
+/* ---------- usuarios (hoja oculta _AUTH) ---------- */
+function users_() {
+  var sh = getSS_().getSheetByName('_AUTH');
+  if (!sh || sh.getLastRow() < 2) return [];
+  var v = sh.getRange(2, 1, sh.getLastRow() - 1, AUTH_HEADERS.length).getValues();
+  return v.map(function (r) {
+    return {
+      id: String(r[0]), username: String(r[1]), name: String(r[2]), email: String(r[3]), role: String(r[4]), cargo: String(r[5]),
+      active: String(r[6]) !== 'false', mustChange: String(r[7]) === 'true', salt: String(r[8]), hash: String(r[9]),
+      updatedAt: String(r[10]), deleted: String(r[11]) === 'true'
+    };
+  });
+}
+function saveUsers_(list) {
+  var ss = getSS_(), sh = sheet_(ss, '_AUTH');
+  sh.clearContents();
+  sh.getRange(1, 1, 1, AUTH_HEADERS.length).setNumberFormat('@').setValues([AUTH_HEADERS]);
+  if (list.length) {
+    var rows = list.map(function (u) {
+      return [u.id, u.username, u.name, u.email || '', u.role, u.cargo || '', String(u.active !== false), String(!!u.mustChange), u.salt, u.hash, u.updatedAt || '', String(!!u.deleted)];
+    });
+    sh.getRange(2, 1, rows.length, AUTH_HEADERS.length).setNumberFormat('@').setValues(rows);
+  }
+  try { sh.hideSheet(); } catch (e) {}
+}
+function pub_(u, admin) {
+  var o = { id: u.id, username: u.username, name: u.name, role: u.role, cargo: u.cargo, active: u.active };
+  if (admin) { o.email = u.email; o.mustChange = u.mustChange; }
+  return o;
+}
+function listFor_(me) {
+  return users_().filter(function (u) { return !u.deleted; }).map(function (u) { return pub_(u, me.role === 'ADMIN'); });
+}
+function adminCount_(list) { return list.filter(function (u) { return !u.deleted && u.active && u.role === 'ADMIN'; }).length; }
+
+/* ---------- sesión firmada ---------- */
+function sig_(s) { return Utilities.base64EncodeWebSafe(Utilities.computeHmacSha256Signature(s, pepper_())); }
+function mkToken_(u) {
+  var pl = u.id + '|' + (Date.now() + TOKEN_TTL_MS) + '|' + u.hash.substr(0, 12);
+  return Utilities.base64EncodeWebSafe(pl) + '.' + sig_(pl);
+}
+function authUser_(t) {
+  if (!t || String(t).indexOf('.') < 0) return null;
+  var p = String(t).split('.'), pl;
+  try { pl = Utilities.newBlob(Utilities.base64DecodeWebSafe(p[0])).getDataAsString(); } catch (e) { return null; }
+  if (!safeEq_(sig_(pl), p[1])) return null;
+  var f = pl.split('|');
+  if (Number(f[1]) < Date.now()) return null;
+  var u = users_().filter(function (x) { return x.id === f[0]; })[0];
+  if (!u || u.deleted || !u.active) return null;
+  if (u.hash.substr(0, 12) !== f[2]) return null; // cambió la contraseña: sesión anterior invalidada
+  return u;
+}
+
+/* ---------- anti fuerza bruta + auditoría ---------- */
+function rlCheck_(un) {
+  if (CacheService.getScriptCache().get('lock_' + un)) throw new Error('Demasiados intentos fallidos. Espere 5 minutos e intente de nuevo.');
+}
+function rlFail_(un) {
+  var c = CacheService.getScriptCache(), n = Number(c.get('f_' + un) || 0) + 1;
+  c.put('f_' + un, String(n), 600);
+  if (n >= 5) { c.put('lock_' + un, '1', 300); c.remove('f_' + un); }
+}
+function log_(user, action, detail) {
+  try {
+    var sh = sheet_(getSS_(), 'AUDITORIA');
+    if (sh.getLastRow() < 1) sh.appendRow(['fecha', 'usuario', 'accion', 'detalle']);
+    sh.appendRow([now_(), user, action, detail || '']);
+  } catch (e) {}
+}
+
+/* ---------- instalación / recuperación (se ejecutan desde el editor) ---------- */
+function instalar() {
+  var list = users_();
+  if (list.some(function (u) { return !u.deleted && u.role === 'ADMIN'; })) {
+    Logger.log('Ya existe un administrador. Si olvidó su clave ejecute restablecerAdmin().');
+    return;
+  }
+  restablecerAdmin();
+}
+function restablecerAdmin() {
+  var list = users_(), pw = randPw_();
+  var u = list.filter(function (x) { return x.username === 'admin' && !x.deleted; })[0];
+  if (!u) {
+    u = { id: 'usr-' + newSalt_().substr(0, 10), username: 'admin', name: 'Administrador Principal', email: '', role: 'ADMIN', cargo: 'Administrador', active: true, deleted: false };
+    list.push(u);
+  }
+  u.salt = newSalt_(); u.hash = hash_(pw, u.salt); u.mustChange = true; u.active = true; u.role = 'ADMIN'; u.updatedAt = now_();
+  saveUsers_(list);
+  log_('sistema', 'admin_restablecido', '');
+  Logger.log('=== USUARIO: admin   CONTRASEÑA TEMPORAL: ' + pw + '   (se pedirá cambiarla al ingresar) ===');
+  Logger.log('Hoja: ' + getSS_().getUrl());
+  var t = login_({ username: 'admin', password: pw });
+  Logger.log('AUTOPRUEBA de inicio de sesión: ' + (t.ok ? 'OK (el hash guardado coincide con la clave)' : 'FALLÓ: ' + t.error));
+  Logger.log('Contexto: ' + JSON.stringify(ctx_()));
+}
+
+/* ---------- diagnóstico ---------- */
+function fp_() { return sig_('fp').substr(0, 8); }
+function ctx_() {
+  var sid = ''; try { sid = ScriptApp.getScriptId(); } catch (e) {}
+  return { script: String(sid).slice(-6), hoja: String(getSS_().getId()).slice(-6), huella: fp_(), usuarios: users_().filter(function (u) { return !u.deleted; }).length };
+}
+/** Ejecútela desde el editor: muestra en el Registro el estado real de usuarios y del hash. */
+function diagnostico() {
+  var c = ctx_();
+  Logger.log('Script ...' + c.script + ' | Hoja ...' + c.hoja + ' (' + getSS_().getUrl() + ') | Huella de clave ' + c.huella + ' | Usuarios ' + c.usuarios);
+  users_().forEach(function (u) {
+    Logger.log('- ' + u.username + ' | rol ' + u.role + ' | activo ' + u.active + ' | eliminado ' + u.deleted + ' | cambiar clave ' + u.mustChange + ' | sal ' + u.salt.length + ' car. | hash ' + u.hash.length + ' car.');
+  });
+  Logger.log('Hash determinista: ' + (hash_('x', 'y') === hash_('x', 'y')));
+}
+/** Edite CLAVE con la contraseña temporal y ejecute: dice si el servidor la acepta (sin pasar por el navegador). */
+function probarLogin() {
+  var USUARIO = 'admin', CLAVE = 'PEGUE_AQUI_LA_CLAVE';
+  var r = login_({ username: USUARIO, password: CLAVE });
+  Logger.log(r.ok ? 'LOGIN OK: el servidor acepta esa clave.' : 'LOGIN FALLÓ: ' + r.error);
+}
+
+/* ---------- Web App ---------- */
+function doGet() { return json_({ ok: true, service: 'StockPulse API', version: VERSION }); }
 
 function doPost(e) {
   var lock = LockService.getScriptLock();
-  lock.waitLock(20000);
+  lock.waitLock(25000);
   try {
-    var body = JSON.parse((e.postData && e.postData.contents) || '{}');
-    if (!body.token || body.token !== TOKEN) return json_({ ok: false, error: 'Token inválido' });
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
-    if (body.action === 'test') return json_({ ok: true, message: 'Conexión verificada', spreadsheetName: ss.getName() });
-    if (body.action === 'pull') return json_({ ok: true, state: readState_(ss) });
-    if (body.action === 'push') { writeState_(ss, body.state || {}); return json_({ ok: true, spreadsheetUrl: ss.getUrl() }); }
-    return json_({ ok: false, error: 'Acción no soportada' });
+    var b = JSON.parse((e.postData && e.postData.contents) || '{}');
+    if (b.action === 'ping') { var c0 = ctx_(); return json_({ ok: true, version: VERSION, instalado: c0.usuarios > 0, script: c0.script, hoja: c0.hoja, huella: c0.huella, usuarios: c0.usuarios }); }
+    if (b.action === 'login') return json_(login_(b));
+    var me = authUser_(b.t);
+    if (!me) return json_({ ok: false, code: 'AUTH', error: 'Sesión inválida o expirada. Inicie sesión de nuevo.' });
+    switch (b.action) {
+      case 'me': return json_({ ok: true, user: pub_(me, true), users: listFor_(me) });
+      case 'password': return json_(changePw_(me, b));
+      case 'user.create': return json_(userCreate_(me, b));
+      case 'user.update': return json_(userUpdate_(me, b));
+      case 'user.delete': return json_(userDelete_(me, b));
+      case 'sync': return json_(sync_(me, b));
+    }
+    return json_({ ok: false, error: 'Acción no soportada: ' + b.action });
   } catch (err) {
-    return json_({ ok: false, error: String(err) });
+    return json_({ ok: false, error: String(err && err.message ? err.message : err) });
   } finally {
     lock.releaseLock();
   }
 }
 
-function sheet_(ss, name) { return ss.getSheetByName(name) || ss.insertSheet(name); }
-
-function readState_(ss) {
-  var sh = ss.getSheetByName('ESTADO_JSON');
-  if (!sh || sh.getLastRow() < 1) return null;
-  var vals = sh.getRange(1, 1, sh.getLastRow(), 1).getValues();
-  var txt = vals.map(function (r) { return r[0]; }).join('');
-  return txt ? JSON.parse(txt) : null;
+function login_(b) {
+  var un = String(b.username || '').trim().toLowerCase();
+  if (!un || !b.password) return { ok: false, error: 'Ingrese usuario y contraseña.' };
+  rlCheck_(un);
+  var list = users_();
+  var u = list.filter(function (x) { return !x.deleted && (x.username === un || (x.email && x.email.toLowerCase() === un)); })[0];
+  var h = hash_(trim_(b.password), u ? u.salt : 'a0a0a0a0a0a0a0a0');
+  if (!u || !safeEq_(h, u.hash)) {
+    rlFail_(un); log_(un, 'login_fallido', '');
+    return { ok: false, error: 'Usuario o contraseña incorrectos.' };
+  }
+  if (!u.active) { log_(u.username, 'login_desactivado', ''); return { ok: false, error: 'Usuario desactivado. Contacte al administrador.' }; }
+  CacheService.getScriptCache().remove('f_' + un);
+  log_(u.username, 'login', '');
+  return { ok: true, token: mkToken_(u), user: pub_(u, true), users: listFor_(u) };
 }
 
-function writeState_(ss, st) {
-  var txt = JSON.stringify(st), chunks = [];
+function changePw_(me, b) {
+  var list = users_(), u = list.filter(function (x) { return x.id === me.id; })[0];
+  if (!safeEq_(hash_(trim_(b.current), u.salt), u.hash)) return { ok: false, error: 'La contraseña actual no es correcta.' };
+  if (!pwOk_(b.npw)) return { ok: false, error: 'La nueva contraseña debe tener mínimo 8 caracteres, con letras y números.' };
+  if (trim_(b.npw) === trim_(b.current)) return { ok: false, error: 'La nueva contraseña debe ser distinta a la actual.' };
+  u.salt = newSalt_(); u.hash = hash_(b.npw, u.salt); u.mustChange = false; u.updatedAt = now_();
+  saveUsers_(list); log_(u.username, 'cambio_password', '');
+  return { ok: true, token: mkToken_(u) };
+}
+
+function needAdmin_(me) { if (me.role !== 'ADMIN') throw new Error('Solo el administrador puede gestionar usuarios.'); }
+function clean_(v) { return String(v == null ? '' : v).replace(/[\u0000-\u001F\u007F<>]/g, '').trim().replace(/^[=+\-@\t\r]+/, '').trim(); }
+
+function userCreate_(me, b) {
+  needAdmin_(me);
+  var list = users_(), un = clean_(b.username).toLowerCase().replace(/\s+/g, '');
+  if (!/^[a-z0-9._-]{3,30}$/.test(un)) throw new Error('El usuario debe tener 3-30 caracteres (letras, números, . _ -).');
+  if (!clean_(b.name)) throw new Error('El nombre es obligatorio.');
+  if (ROLES.indexOf(b.role) < 0) throw new Error('Rol inválido.');
+  if (list.some(function (x) { return !x.deleted && x.username === un; })) throw new Error('Ese nombre de usuario ya existe.');
+  if (!pwOk_(b.password)) throw new Error('La contraseña debe tener mínimo 8 caracteres, con letras y números.');
+  var u = { id: 'usr-' + newSalt_().substr(0, 10), username: un, name: clean_(b.name), email: clean_(b.email).toLowerCase(), role: b.role, cargo: clean_(b.cargo) || 'Usuario', active: true, deleted: false, mustChange: !!b.mustChange, updatedAt: now_() };
+  u.salt = newSalt_(); u.hash = hash_(b.password, u.salt);
+  list.push(u); saveUsers_(list); log_(me.username, 'crear_usuario', un);
+  return { ok: true, user: pub_(u, true), users: listFor_(me) };
+}
+
+function userUpdate_(me, b) {
+  needAdmin_(me);
+  var list = users_(), u = list.filter(function (x) { return x.id === b.id && !x.deleted; })[0];
+  if (!u) throw new Error('Usuario no encontrado.');
+  if (b.role && ROLES.indexOf(b.role) < 0) throw new Error('Rol inválido.');
+  if (b.role && b.role !== u.role && u.role === 'ADMIN' && adminCount_(list) <= 1) throw new Error('Debe existir al menos un administrador activo.');
+  if (b.active === false && u.role === 'ADMIN' && adminCount_(list) <= 1) throw new Error('No se puede desactivar al único administrador.');
+  if (b.active === false && u.id === me.id) throw new Error('No puede desactivar su propia cuenta.');
+  if (b.name && clean_(b.name)) u.name = clean_(b.name);
+  if (b.email != null) u.email = clean_(b.email).toLowerCase();
+  if (b.cargo != null) u.cargo = clean_(b.cargo);
+  if (b.role) u.role = b.role;
+  if (b.active != null) u.active = !!b.active;
+  if (b.password) {
+    if (!pwOk_(b.password)) throw new Error('La contraseña debe tener mínimo 8 caracteres, con letras y números.');
+    u.salt = newSalt_(); u.hash = hash_(b.password, u.salt); u.mustChange = !!b.mustChange;
+  }
+  u.updatedAt = now_(); saveUsers_(list); log_(me.username, 'editar_usuario', u.username);
+  return { ok: true, user: pub_(u, true), users: listFor_(me) };
+}
+
+function userDelete_(me, b) {
+  needAdmin_(me);
+  var list = users_(), u = list.filter(function (x) { return x.id === b.id && !x.deleted; })[0];
+  if (!u) throw new Error('Usuario no encontrado.');
+  if (u.id === me.id) throw new Error('No puede eliminar su propia cuenta.');
+  if (u.role === 'ADMIN' && adminCount_(list) <= 1) throw new Error('No se puede eliminar al único administrador.');
+  u.deleted = true; u.active = false; u.updatedAt = now_();
+  saveUsers_(list); log_(me.username, 'eliminar_usuario', u.username);
+  return { ok: true, users: listFor_(me) };
+}
+
+/* ---------- datos: sincronización con reglas por rol ---------- */
+function readState_() {
+  var sh = getSS_().getSheetByName('ESTADO_JSON');
+  if (!sh || sh.getLastRow() < 1) return { company: null, inventories: [], traceability: [] };
+  var txt = sh.getRange(1, 1, sh.getLastRow(), 1).getValues().map(function (r) { return r[0]; }).join('');
+  var s = txt ? JSON.parse(txt) : null;
+  return s ? { company: s.company || null, inventories: s.inventories || [], traceability: s.traceability || [] } : { company: null, inventories: [], traceability: [] };
+}
+function clone_(o) { return JSON.parse(JSON.stringify(o)); }
+function itemTs_(i) { var a = [i.datetimeConteo2, i.datetimeConteo1].filter(Boolean).sort(); return a.length ? a[a.length - 1] : ''; }
+function mergeInv_(a, b) {
+  var fin = a.estado === 'FINALIZADO' ? a : (b.estado === 'FINALIZADO' ? b : null);
+  var head = fin || ((a.updatedAt || '') >= (b.updatedAt || '') ? a : b), oth = head === a ? b : a;
+  var m = {}, order = [];
+  (oth.items || []).forEach(function (i) { m[i.idDetalle] = i; order.push(i.idDetalle); });
+  (head.items || []).forEach(function (i) {
+    var o = m[i.idDetalle];
+    if (!o) order.push(i.idDetalle);
+    m[i.idDetalle] = (o && itemTs_(o) > itemTs_(i) && !fin) ? o : i;
+  });
+  var r = clone_(head);
+  r.items = order.map(function (id) { return m[id]; });
+  r.reconteoHabilitado = !!(a.reconteoHabilitado || b.reconteoHabilitado);
+  r.deleted = !!head.deleted;
+  return r;
+}
+function qty_(v) { return (v === null || v === undefined) ? null : (isFinite(Number(v)) && Number(v) >= 0 && Math.round(Number(v)) === Number(v) ? Number(v) : null); }
+function countFields_(dst, src) {
+  dst.conteo1 = qty_(src.conteo1); dst.conteo2 = qty_(src.conteo2);
+  dst.datetimeConteo1 = src.datetimeConteo1 || null; dst.datetimeConteo2 = src.datetimeConteo2 || null;
+  dst.usuarioConteo1 = src.usuarioConteo1 || null; dst.usuarioConteo2 = src.usuarioConteo2 || null;
+  dst.notas = clean_(src.notas);
+}
+/** Qué puede escribir cada rol. Devuelve lo que se acepta del inventario entrante. */
+function sanitizeInv_(role, inc, ex) {
+  if (role === 'ADMIN') return inc;
+  if (role === 'SUPERVISOR') { var s = clone_(inc); s.deleted = ex ? !!ex.deleted : false; return s; }
+  if (role === 'OPERARIO') {
+    if (!ex || ex.estado === 'FINALIZADO') return null;           // no crea inventarios ni toca finalizados
+    var r = clone_(ex), idx = {};
+    r.items.forEach(function (i, k) { idx[i.idDetalle] = k; });
+    (inc.items || []).forEach(function (ii) {
+      var k = idx[ii.idDetalle];
+      if (k !== undefined) { countFields_(r.items[k], ii); }
+      else if (String(ii.idDetalle).indexOf('det-sc-') === 0) {   // ítem añadido en campo: siempre con teórico 0
+        var n = { idDetalle: String(ii.idDetalle), idInventario: ex.idInventario, sku: clean_(ii.sku), barcode: clean_(ii.barcode), descripcion: clean_(ii.descripcion), categoriaMarca: 'Escaneado en Campo', ubicacion: clean_(ii.ubicacion), stockTeorico: 0, requiereReconteo: !!(ex.reconteoHabilitado && ii.requiereReconteo) };
+        countFields_(n, ii); r.items.push(n); idx[n.idDetalle] = r.items.length - 1;
+      }
+    });
+    if (ex.estado === 'PENDIENTE' && inc.estado === 'EN_CURSO') { r.estado = 'EN_CURSO'; r.fechaHoraInicio = inc.fechaHoraInicio || now_(); }
+    r.updatedAt = inc.updatedAt || now_();
+    return r;
+  }
+  return null; // CONSULTOR: solo lectura
+}
+function mergeServer_(ex, inc, role) {
+  var out = { company: ex.company || null, inventories: ex.inventories.slice(), traceability: ex.traceability.slice() };
+  if (!inc || role === 'CONSULTOR') return out;
+  if (role === 'ADMIN' && inc.company) out.company = inc.company;
+  var idx = {};
+  out.inventories.forEach(function (i, k) { idx[i.idInventario] = k; });
+  (inc.inventories || []).forEach(function (ii) {
+    var k = idx[ii.idInventario], ei = k === undefined ? null : out.inventories[k];
+    var s = sanitizeInv_(role, ii, ei);
+    if (!s) return;
+    if (ei) out.inventories[k] = mergeInv_(s, ei); // en empate de segundo gana lo que llega ahora
+    else { out.inventories.push(s); idx[s.idInventario] = out.inventories.length - 1; }
+  });
+  if (role === 'ADMIN' || role === 'SUPERVISOR') {
+    var seen = {};
+    out.traceability.forEach(function (t) { seen[t.idTrazabilidad] = 1; });
+    (inc.traceability || []).forEach(function (t) { if (!seen[t.idTrazabilidad]) { seen[t.idTrazabilidad] = 1; out.traceability.push(t); } });
+  }
+  var alive = {};
+  out.inventories.forEach(function (i) { if (!i.deleted) alive[i.idInventario] = 1; });
+  out.traceability = out.traceability.filter(function (t) { return alive[t.idInventario]; })
+    .sort(function (a, b) { return a.fechaRegistro < b.fechaRegistro ? 1 : -1; });
+  return out;
+}
+function sync_(me, b) {
+  var ex = readState_(), merged = mergeServer_(ex, b.state, me.role);
+  var a = JSON.stringify(ex), c = JSON.stringify(merged);
+  if (a !== c) writeState_(merged);
+  return { ok: true, state: merged, users: listFor_(me), spreadsheetUrl: getSS_().getUrl() };
+}
+
+function writeState_(st) {
+  var ss = getSS_(), txt = JSON.stringify(st), chunks = [];
   for (var i = 0; i < txt.length; i += 40000) chunks.push([txt.substr(i, 40000)]);
   var js = sheet_(ss, 'ESTADO_JSON');
   js.clearContents();
   if (chunks.length) js.getRange(1, 1, chunks.length, 1).setNumberFormat('@').setValues(chunks);
-  js.hideSheet();
-
+  try { js.hideSheet(); } catch (e) {}
   var invs = (st.inventories || []).filter(function (i) { return !i.deleted; });
   table_(ss, 'INVENTARIOS',
     ['idInventario', 'titulo', 'estado', 'fechaRealizacion', 'fechaHoraInicio', 'fechaHoraFin', 'duracionMinutos', 'responsable', 'auditor', 'exactitud'],
@@ -172,28 +475,33 @@ function writeState_(ss, st) {
     ['fechaRegistro', 'idInventario', 'sku', 'descripcion', 'stockTeorico', 'cantidadContada', 'diferencia', 'responsable', 'notas'],
     (st.traceability || []).map(function (t) { return [t.fechaRegistro, t.idInventario, t.sku, t.descripcion, t.stockTeorico, t.cantidadContada, t.diferencia, t.responsable, t.notas]; }));
   table_(ss, 'USUARIOS', ['username', 'nombre', 'correo', 'rol', 'cargo', 'activo'],
-    (st.users || []).filter(function (u) { return !u.deleted; }).map(function (u) { return [u.username, u.name, u.email, u.role, u.cargo, u.active !== false]; }));
+    users_().filter(function (u) { return !u.deleted; }).map(function (u) { return [u.username, u.name, u.email, u.role, u.cargo, u.active]; }));
 }
-
 function safe_(v) {
   if (v === null || v === undefined) return '';
   if (typeof v === 'string') return v.replace(/^[=+\-@\t\r]+/, '');
   return v;
 }
-
 function table_(ss, name, headers, rows) {
   var sh = sheet_(ss, name);
   sh.clearContents();
   sh.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold').setBackground('#0F4C81').setFontColor('#FFFFFF');
   sh.setFrozenRows(1);
   if (!rows.length) return;
-  var clean = rows.map(function (r) { return r.map(safe_); });
-  sh.getRange(2, 1, clean.length, headers.length).setNumberFormat('@').setValues(clean);
+  var c = rows.map(function (r) { return r.map(safe_); });
+  sh.getRange(2, 1, c.length, headers.length).setNumberFormat('@').setValues(c);
 }
 `;
 
 /* ===================== CONFIG / ESTADO ===================== */
-var SEED={"company":{"id":"1234567890","name":"EL REY DE LOS LICORES","nit":"900.000.000-1","sector":"Comercio de licores","sedePrincipal":"Sede Principal"},"users":[{"id":"usr-admin","username":"admin","name":"Administrador Principal","email":"","role":"ADMIN","cargo":"Administrador · El Rey de los Licores","active":true,"mustChange":true,"salt":"64558e6d772cc3319df5157b","hash":"641569e3a41dc5f99fc46aaeb7134ffeeba37a964c0d552b2ae3b676fb57c6a1","updatedAt":"2026-11-21 22:33:56"},{"id":"usr-supervisor","username":"supervisor","name":"Supervisor de Auditoría","email":"","role":"SUPERVISOR","cargo":"Supervisor de Auditoría Interna","active":true,"mustChange":true,"salt":"5a6f5b466a4437b83f8658e6","hash":"6353ad07a20a162f366e9212a5fa80872715ca7c30e761e5802d5f90756dbfc5","updatedAt":"2026-11-21 22:33:56"},{"id":"usr-operario","username":"operario","name":"Operario de Bodega","email":"","role":"OPERARIO","cargo":"Operario de Bodega","active":true,"mustChange":true,"salt":"fb509f8ce2e8d5c623e192d0","hash":"b326b7672441062804d2742fc397be92275823bb7d69f2b691a3fe7e67a7e701","updatedAt":"2026-11-21 22:33:56"},{"id":"usr-consultor","username":"consultor","name":"Consultor Externo","email":"","role":"CONSULTOR","cargo":"Consultoría (solo lectura)","active":true,"mustChange":true,"salt":"6e14e5e3369af295c01d1b19","hash":"5765db8f424e4f29be31800ec351352e345b47a25a7df14dd2900a93703f1ac6","updatedAt":"2026-11-21 22:33:56"}],"inventories":[],"traceability":[],"integration":{"url":"","token":"","auto":false,"lastSyncAt":null,"lastSyncStatus":"idle","lastSyncMessage":"","spreadsheetUrl":""},"audit":[]};
+var SEED={"company":{"id":"1234567890","name":"EL REY DE LOS LICORES","nit":"900.000.000-1","sector":"Comercio de licores","sedePrincipal":"Sede Principal"},"users":[],"inventories":[],"traceability":[],"integration":{"url":"https://script.google.com/macros/s/AKfycbyw7yfXBvMt5fqsTGq8gYROP5x5DduHuRUebzPV2MDRYRQe_KOp6G1zx9biIpIC2tqEIA/exec","auto":true,"lastSyncAt":null,"lastSyncStatus":"idle","lastSyncMessage":"","spreadsheetUrl":""},"audit":[]};
+var MEM={};
+function stGet(w,k){try{return window[w].getItem(k)}catch(e){return MEM[w+k]!==undefined?MEM[w+k]:null}}
+function stSet(w,k,v){try{window[w].setItem(k,v)}catch(e){MEM[w+k]=v}}
+function stDel(w,k){try{window[w].removeItem(k)}catch(e){delete MEM[w+k]}}
+var APP_VERSION='4.1';
+window.addEventListener('error',function(e){try{toast('error','Error inesperado',e.message)}catch(x){}});
+window.addEventListener('unhandledrejection',function(e){try{toast('error','Error inesperado',(e.reason&&e.reason.message)||String(e.reason))}catch(x){}});
 var KEY='stockpulse_v2_'+SEED.company.id;
 var ROLES={ADMIN:'Administrador',SUPERVISOR:'Supervisor / Auditor',OPERARIO:'Operario / Contador',CONSULTOR:'Consultor (solo lectura)'};
 var PERM={createInv:['ADMIN','SUPERVISOR'],count:['ADMIN','SUPERVISOR','OPERARIO'],toggleTheo:['ADMIN','SUPERVISOR'],
@@ -208,17 +516,21 @@ function pad(n){return String(n).padStart(2,'0')}
 function now(){var d=new Date();return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+' '+pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds())}
 function uid(p){return p+Date.now().toString(36)+Math.random().toString(36).slice(2,6)}
 function randSalt(){var a=new Uint8Array(12);crypto.getRandomValues(a);return Array.prototype.map.call(a,function(x){return ('0'+x.toString(16)).slice(-2)}).join('')}
+function stripSensitive(s){ // jamás se guardan usuarios, hashes, sales ni tokens en el navegador
+  s.users=[];if(s.integration){delete s.integration.token}return s;
+}
+function persistable(s){var o=Object.assign({},s);o.users=[];return o}
 function loadState(){
-  try{var j=JSON.parse(localStorage.getItem(KEY));if(j&&j.users&&j.inventories)return j}catch(e){}
-  var s=JSON.parse(JSON.stringify(SEED));s.audit=[];try{localStorage.setItem(KEY,JSON.stringify(s))}catch(e){}return s;
+  try{var j=JSON.parse(stGet('localStorage',KEY));if(j&&j.inventories){stripSensitive(j);stSet('localStorage',KEY,JSON.stringify(persistable(j)));return j}}catch(e){}
+  var s=JSON.parse(JSON.stringify(SEED));s.audit=[];stripSensitive(s);stSet('localStorage',KEY,JSON.stringify(persistable(s)));return s;
 }
 var bc=null;try{bc=new BroadcastChannel(KEY)}catch(e){}
 var syncTimer=null;
 function save(opts){
   opts=opts||{};
-  try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){toast('error','No se pudo guardar localmente','Almacenamiento lleno o bloqueado.')}
+  stSet('localStorage',KEY,JSON.stringify(persistable(S)));
   if(bc)try{bc.postMessage('upd')}catch(e){}
-  if(!opts.noSync&&S.integration.auto&&S.integration.url){clearTimeout(syncTimer);syncTimer=setTimeout(function(){syncNow(true)},2500)}
+  if(!opts.noSync&&session&&S.integration.auto&&S.integration.url){clearTimeout(syncTimer);syncTimer=setTimeout(function(){syncNow(true)},2500)}
 }
 function audit(action,detail){S.audit=S.audit||[];S.audit.unshift({t:now(),u:session?session.username:'-',a:action,d:detail||''});S.audit.length=Math.min(S.audit.length,300)}
 function vis(){return S.inventories.filter(function(i){return !i.deleted})}
@@ -239,27 +551,26 @@ function touch(inv){inv.updatedAt=now()}
 function fmtN(n){return Number(n).toLocaleString('es-CO')}
 function dl(name,blob){var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;document.body.appendChild(a);a.click();setTimeout(function(){URL.revokeObjectURL(a.href);a.remove()},500)}
 
-/* ===================== AUTENTICACIÓN ===================== */
-var LOCK_KEY=KEY+'_lock';
-function lockInfo(){try{return JSON.parse(localStorage.getItem(LOCK_KEY))||{n:0,until:0}}catch(e){return {n:0,until:0}}}
-function tryLogin(user,pass){
-  var L=lockInfo();if(L.until>Date.now())throw new Error('Demasiados intentos. Espere '+Math.ceil((L.until-Date.now())/1000)+' s.');
-  var key=String(user||'').trim().toLowerCase();
-  var u=S.users.find(function(x){return !x.deleted&&(x.username.toLowerCase()===key||(x.email||'').toLowerCase()===key)});
-  var ok=u&&u.active!==false&&hashPw(pass||'',u.salt)===u.hash;
-  if(!ok){L.n++;if(L.n>=5){L.until=Date.now()+60000;L.n=0}localStorage.setItem(LOCK_KEY,JSON.stringify(L));audit('login_fallido',key);save({noSync:true});
-    throw new Error(u&&u.active===false?'Usuario desactivado. Contacte al administrador.':'Usuario o contraseña incorrectos.')}
-  localStorage.removeItem(LOCK_KEY);session=u;
-  sessionStorage.setItem(KEY+'_s',JSON.stringify({id:u.id,last:Date.now()}));audit('login','');save({noSync:true});return u;
+/* ===================== AUTENTICACIÓN (validada en el servidor) ===================== */
+var SK=KEY+'_s';
+function saveSess(){stSet('sessionStorage',SK,JSON.stringify({s:session,last:Date.now()}))}
+async function serverLogin(user,pass){
+  if(!S.integration.url)throw new Error('Configure la URL del servidor (Google Apps Script) en el campo «Servidor».');
+  var r=await gas('login',{username:String(user||'').trim(),password:pass||''},true);
+  session=Object.assign({},r.user,{token:r.token});if(r.users)S.users=r.users;saveSess();audit('login','');save({noSync:true});return session;
 }
 function restoreSession(){
-  try{var j=JSON.parse(sessionStorage.getItem(KEY+'_s'));if(j&&Date.now()-j.last<30*60000){var u=S.users.find(function(x){return x.id===j.id&&!x.deleted&&x.active!==false});if(u){session=u;return}}}catch(e){}
-  sessionStorage.removeItem(KEY+'_s');
+  try{var j=JSON.parse(stGet('sessionStorage',SK));if(j&&j.s&&j.s.token&&Date.now()-j.last<30*60000){session=j.s;return}}catch(e){}
+  stDel('sessionStorage',SK);
 }
-function logout(){if(session)audit('logout','');save({noSync:true});session=null;sessionStorage.removeItem(KEY+'_s');ui.view='dashboard';render()}
-function activity(){if(session)try{var j=JSON.parse(sessionStorage.getItem(KEY+'_s'));j.last=Date.now();sessionStorage.setItem(KEY+'_s',JSON.stringify(j))}catch(e){}}
+async function refreshMe(){
+  if(!session)return;
+  try{var r=await gas('me');Object.assign(session,r.user);if(r.users)S.users=r.users;saveSess();save({noSync:true})}catch(e){}
+}
+function forceLogout(msg){session=null;stDel('sessionStorage',SK);ui.view='dashboard';ui.loginErr=msg||'';try{closeModal()}catch(e){}render()}
+function logout(){if(session)audit('logout','');save({noSync:true});session=null;stDel('sessionStorage',SK);ui.view='dashboard';ui.loginErr='';render()}
+function activity(){if(session)try{var j=JSON.parse(stGet('sessionStorage',SK));j.last=Date.now();stSet('sessionStorage',SK,JSON.stringify(j))}catch(e){}}
 function pwOk(p){return p&&p.length>=8&&/[A-Za-z]/.test(p)&&/\d/.test(p)}
-function setPassword(u,p){u.salt=randSalt();u.hash=hashPw(p,u.salt);u.mustChange=false;u.updatedAt=now()}
 
 /* ===================== LÓGICA DE NEGOCIO ===================== */
 function nextInvId(){
@@ -352,38 +663,19 @@ function deleteInventory(id){
   if(inv.estado!=='PENDIENTE')throw new Error('Solo se pueden eliminar inventarios PENDIENTES.');
   inv.deleted=true;touch(inv);audit('eliminar_inventario',id);save();
 }
-/* usuarios */
-function adminCount(){return S.users.filter(function(u){return !u.deleted&&u.active!==false&&u.role==='ADMIN'}).length}
-function createUser(d){
-  need('users');var un=clean(d.username).toLowerCase().replace(/\s+/g,'');
-  if(!un||!clean(d.name))throw new Error('Usuario y nombre son obligatorios.');
-  if(!/^[a-z0-9._-]{3,30}$/.test(un))throw new Error('El usuario debe tener 3-30 caracteres (letras, números, . _ -).');
-  if(S.users.some(function(u){return !u.deleted&&u.username===un}))throw new Error('Ese nombre de usuario ya existe.');
-  if(!pwOk(d.password))throw new Error('La contraseña debe tener mínimo 8 caracteres, con letras y números.');
-  var u={id:uid('usr-'),username:un,name:clean(d.name),email:clean(d.email).toLowerCase(),role:d.role,cargo:clean(d.cargo)||'Usuario',active:true,mustChange:!!d.mustChange,updatedAt:now()};
-  setPassword(u,d.password);u.mustChange=!!d.mustChange;S.users.push(u);audit('crear_usuario',un);save();return u;
+/* usuarios (la validación real ocurre en el servidor) */
+async function createUser(d){
+  need('users');if(!pwOk(d.password))throw new Error('La contraseña debe tener mínimo 8 caracteres, con letras y números.');
+  var r=await gas('user.create',d);S.users=r.users;audit('crear_usuario',d.username);save({noSync:true});return r.user;
 }
-function updateUser(id,d){
-  need('users');var u=S.users.find(function(x){return x.id===id&&!x.deleted});if(!u)throw new Error('Usuario no encontrado.');
-  if(d.role&&d.role!==u.role&&u.role==='ADMIN'&&adminCount()<=1)throw new Error('Debe existir al menos un administrador activo.');
-  if(d.active===false&&u.role==='ADMIN'&&adminCount()<=1)throw new Error('No se puede desactivar al único administrador.');
-  if(d.active===false&&u.id===session.id)throw new Error('No puede desactivar su propia cuenta.');
-  if(d.name)u.name=clean(d.name);if(d.email!=null)u.email=clean(d.email).toLowerCase();if(d.cargo!=null)u.cargo=clean(d.cargo);
-  if(d.role)u.role=d.role;if(d.active!=null)u.active=d.active;
-  if(d.password){if(!pwOk(d.password))throw new Error('La contraseña debe tener mínimo 8 caracteres, con letras y números.');setPassword(u,d.password);u.mustChange=!!d.mustChange}
-  u.updatedAt=now();audit('editar_usuario',u.username);save();return u;
+async function updateUser(id,d){
+  need('users');var r=await gas('user.update',Object.assign({id:id},d));S.users=r.users;
+  if(session&&id===session.id)Object.assign(session,r.user);saveSess();audit('editar_usuario',r.user.username);save({noSync:true});return r.user;
 }
-function deleteUser(id){
-  need('users');var u=S.users.find(function(x){return x.id===id&&!x.deleted});if(!u)throw new Error('Usuario no encontrado.');
-  if(u.id===session.id)throw new Error('No puede eliminar su propia cuenta.');
-  if(u.role==='ADMIN'&&adminCount()<=1)throw new Error('No se puede eliminar al único administrador.');
-  u.deleted=true;u.active=false;u.updatedAt=now();audit('eliminar_usuario',u.username);save();
-}
-function changeOwnPassword(cur,np){
-  if(hashPw(cur||'',session.salt)!==session.hash)throw new Error('La contraseña actual no es correcta.');
+async function deleteUser(id){need('users');var r=await gas('user.delete',{id:id});S.users=r.users;audit('eliminar_usuario',id);save({noSync:true})}
+async function changeOwnPassword(cur,np){
   if(!pwOk(np))throw new Error('La nueva contraseña debe tener mínimo 8 caracteres, con letras y números.');
-  if(np===cur)throw new Error('La nueva contraseña debe ser distinta a la actual.');
-  setPassword(session,np);audit('cambio_password','');save();
+  var r=await gas('password',{current:cur,npw:np});session.token=r.token;session.mustChange=false;saveSess();audit('cambio_password','');save({noSync:true});
 }
 
 /* ===================== IMPORTACIÓN ===================== */
@@ -510,33 +802,50 @@ function mergeInv(a,b){
   r.reconteoHabilitado=a.reconteoHabilitado||b.reconteoHabilitado;r.deleted=head.deleted;return r;
 }
 function mergeState(rm){
-  var um=new Map(S.users.map(function(u){return [u.id,u]}));
-  (rm.users||[]).forEach(function(r){var l=um.get(r.id);if(!l||(r.updatedAt||'')>(l.updatedAt||''))um.set(r.id,r)});
-  S.users=Array.from(um.values());
-  if(session){var me=S.users.find(function(u){return u.id===session.id});if(me)session=me}
+  if(rm.company&&rm.company.name)S.company=Object.assign({},S.company,rm.company);
   var im=new Map(S.inventories.map(function(i){return [i.idInventario,i]}));
-  (rm.inventories||[]).forEach(function(r){var l=im.get(r.idInventario);im.set(r.idInventario,l?mergeInv(l,r):r)});
+  (rm.inventories||[]).forEach(function(r){var l=im.get(r.idInventario);im.set(r.idInventario,l?mergeInv(r,l):r)});
   S.inventories=Array.from(im.values());
   var tm=new Map(S.traceability.map(function(t){return [t.idTrazabilidad,t]}));(rm.traceability||[]).forEach(function(t){if(!tm.has(t.idTrazabilidad))tm.set(t.idTrazabilidad,t)});
   S.traceability=Array.from(tm.values()).filter(function(t){var inv=S.inventories.find(function(i){return i.idInventario===t.idInventario});return inv&&!inv.deleted}).sort(function(a,b){return a.fechaRegistro<b.fechaRegistro?1:-1});
 }
-async function gas(action,extra){
-  var I=S.integration;if(!I.url)throw new Error('Configure primero la URL de Google Apps Script.');
-  var r=await fetch(I.url,{method:'POST',redirect:'follow',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify(Object.assign({action:action,token:I.token},extra||{}))});
-  var t=(await r.text()).trim();if(t.charAt(0)==='<')throw new Error('La URL devolvió HTML. En Apps Script: Implementar → Aplicación web → "Quién tiene acceso: Cualquier usuario".');
-  var j;try{j=JSON.parse(t)}catch(e){throw new Error('Respuesta no válida de Apps Script (HTTP '+r.status+').')}
-  if(j.ok===false)throw new Error(j.error||'Error en Apps Script');return j;
-}
-var syncing=false;
-async function syncNow(silent){
-  if(syncing||!S.integration.url)return;syncing=true;var I=S.integration;
+async function gas(action,extra,noAuth){
+  var I=S.integration;if(!I.url)throw new Error('Configure primero la URL del servidor (Google Apps Script).');
+  var body=Object.assign({action:action},extra||{});if(!noAuth&&session)body.t=session.token;
+  var r,t;
+  var tm,res;
   try{
-    var pull=await gas('pull');if(pull.state)mergeState(pull.state);
-    var res=await gas('push',{state:{company:S.company,users:S.users,inventories:S.inventories,traceability:S.traceability}});
-    I.lastSyncAt=now();I.lastSyncStatus='ok';I.lastSyncMessage='Sincronizado ('+vis().length+' inventarios)'+(res.spreadsheetUrl?'':'');if(res.spreadsheetUrl)I.spreadsheetUrl=res.spreadsheetUrl;
+    var fp=fetch(I.url,{method:'POST',redirect:'follow',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify(body)}).then(function(x){return x.text().then(function(tx){return {r:x,t:tx}})});
+    var to=new Promise(function(_,rej){tm=setTimeout(function(){rej(new Error('__TIMEOUT__'))},45000)});
+    res=await Promise.race([fp,to]);r=res.r;t=res.t.trim();
+  }catch(e){clearTimeout(tm);if(e&&e.message==='__TIMEOUT__')throw new Error('El servidor tardó más de 45 s en responder. Reintente (la primera llamada de Apps Script puede ser lenta) y verifique que la implementación esté activa.');
+    throw new Error('No se pudo contactar con el servidor ('+((e&&e.message)||'red')+'). Verifique: 1) la URL termine en /exec y sea la de la implementación vigente, 2) acceso "Cualquier usuario", 3) que haya ejecutado instalar() una vez y 4) su conexión a internet.')}
+  clearTimeout(tm);
+  if(t.charAt(0)==='<'){var m=/<title>([^<]*)<\/title>/i.exec(t);throw new Error('El servidor devolvió una página HTML'+(m?' ("'+m[1]+'")':'')+' en lugar de JSON. Revise: Implementar → Administrar implementaciones → "Quién tiene acceso: Cualquier usuario". Si cambió el código, cree una NUEVA VERSIÓN de la implementación.')}
+  var j;try{j=JSON.parse(t)}catch(e){throw new Error('Respuesta no válida del servidor (HTTP '+r.status+'): '+t.slice(0,160))}
+  if(j.ok===false){
+    if(j.code==='AUTH'&&session){forceLogout('Su sesión expiró o fue revocada. Inicie sesión nuevamente.')}
+    var msg=j.error||'Error en el servidor';if(/no soportada|Token inv[aá]lido/i.test(msg))msg='El servidor tiene el código ANTIGUO de Apps Script (responde «'+msg+'»). '+'Pegue el Code.gs v4, ejecute instalar() y publique una NUEVA VERSIÓN de la implementación.';
+    throw new Error(msg)}
+  return j;
+}
+var syncP=null,syncAgain=false;
+function syncNow(silent){
+  if(syncP){if(silent){syncAgain=true;return syncP}return syncP.then(function(){return syncNow(false)})}
+  if(!S.integration.url||!session)return Promise.resolve();
+  var done=function(){syncP=null;if(syncAgain){syncAgain=false;return syncNow(true)}};
+  syncP=syncCore(silent).then(done,done);return syncP;
+}
+async function syncCore(silent){
+  var I=S.integration;
+  try{
+    var res=await gas('sync',{state:{company:S.company,inventories:S.inventories,traceability:S.traceability}});
+    mergeState(res.state);if(res.users){S.users=res.users;var me=S.users.find(function(u){return u.id===session.id});
+      if(!me||me.active===false){save({noSync:true});forceLogout('Su usuario ya no tiene acceso.');return}
+      if(me.role!==session.role){session.role=me.role;saveSess()}}
+    I.lastSyncAt=now();I.lastSyncStatus='ok';I.lastSyncMessage='Sincronizado ('+vis().length+' inventarios)';if(res.spreadsheetUrl)I.spreadsheetUrl=res.spreadsheetUrl;
     save({noSync:true});if(!silent)toast('success','Sincronización completa',I.lastSyncMessage);refreshLive();
   }catch(e){I.lastSyncAt=now();I.lastSyncStatus='error';I.lastSyncMessage=e.message;save({noSync:true});if(!silent)toast('error','Falló la sincronización',e.message)}
-  finally{syncing=false}
 }
 setInterval(function(){if(session&&S.integration.auto&&S.integration.url&&!document.hidden)syncNow(true)},30000);
 
@@ -553,12 +862,13 @@ function icon(n){return {box:'▦',scan:'⌁'}[n]||''}
 function vLogin(err){
   return '<div class="login"><div class="box"><div class="hero"><div style="font-size:12px;opacity:.8;font-weight:700;letter-spacing:.06em">STOCKPULSE · TOMA FÍSICA DE INVENTARIOS</div>'+
   '<h1 style="margin-top:6px">'+esc(S.company.name)+'</h1><div style="opacity:.8;font-size:12px;margin-top:2px">NIT '+esc(S.company.nit)+'</div></div>'+
-  '<form id="loginForm" autocomplete="on">'+(err?'<div class="err">'+esc(err)+'</div>':'')+
+  '<form id="loginForm" autocomplete="on">'+(err?'<div class="err">'+esc(err)+(/incorrectos/.test(err)?'<div class="small" style="margin-top:6px">Si acaba de ejecutar <b>restablecerAdmin()</b>, copie solo la clave (sin espacios) y use la <b>última</b> que mostró el registro. En Apps Script ejecute <b>diagnostico()</b> y compare «Script/Hoja/Huella» con <b>⚙ Servidor → Probar conexión</b>.</div>':'')+'</div>':'')+
   '<div><label for="lu">Usuario o correo</label><input id="lu" name="username" autocomplete="username" autocapitalize="none" required autofocus></div>'+
   '<div><label for="lp">Contraseña</label><div class="row" style="flex-wrap:nowrap"><input id="lp" name="password" type="password" autocomplete="current-password" required>'+
   '<button type="button" class="btn" data-act="togglePw" title="Mostrar/ocultar">👁</button></div></div>'+
   '<button class="btn p" type="submit" style="justify-content:center">Iniciar sesión</button>'+
-  '<div class="small muted center">Acceso restringido a personal autorizado de '+esc(S.company.name)+'.</div></form></div></div>';
+  '<details '+(S.integration.url?'':'open')+'><summary class="small muted" style="cursor:pointer">⚙ Servidor (Google Apps Script)</summary><div style="margin-top:8px"><input id="lsrv" value="'+esc(S.integration.url)+'" placeholder="https://script.google.com/macros/s/…/exec" autocomplete="off"><div class="row" style="margin-top:8px"><button type="button" class="btn s" data-act="loginPing">🔌 Probar conexión</button></div><div id="lstatus" class="small" style="margin-top:6px"></div></div></details>'+
+  '<div class="small muted center">Acceso restringido a personal autorizado de '+esc(S.company.name)+'. · v'+APP_VERSION+'</div></form></div></div>';
 }
 
 /* ===================== SHELL ===================== */
@@ -796,10 +1106,10 @@ function vSettings(){
   '<div class="card col"><h2>Respaldo de datos</h2><div class="muted small">Los datos viven en este navegador. Descargue respaldos periódicos o sincronice con Google Sheets.</div><div class="row"><button class="btn" data-act="backup">⬇ Descargar respaldo (.json)</button><label class="btn">⬆ Restaurar respaldo<input type="file" id="restore" accept=".json" style="display:none"></label></div></div></div>'+
   '<div class="card col" style="margin-top:14px"><div class="row sp"><h2>Google Sheets · Apps Script</h2>'+(I.lastSyncAt?'<span class="badge '+(I.lastSyncStatus==='error'?'b-er':'b-ok')+'">'+esc(I.lastSyncStatus==='error'?'Error':'OK')+' · '+esc(I.lastSyncAt)+'</span>':'<span class="badge b-in">Sin sincronizar</span>')+'</div>'+
   (I.lastSyncMessage?'<div class="small muted">'+esc(I.lastSyncMessage)+'</div>':'')+
-  '<form id="intForm" class="col"><div class="grid g2"><div><label>URL de la Web App de Apps Script</label><input id="i_url" value="'+esc(I.url)+'" placeholder="https://script.google.com/macros/s/…/exec"></div><div><label>Token secreto (el mismo del script)</label><input id="i_tok" type="password" value="'+esc(I.token)+'" autocomplete="off"></div></div>'+
+  '<form id="intForm" class="col"><div><label>URL de la Web App de Apps Script (única configuración que necesita este archivo)</label><input id="i_url" value="'+esc(I.url)+'" placeholder="https://script.google.com/macros/s/…/exec"></div>'+
   '<label class="row" style="font-weight:600"><input type="checkbox" id="i_auto" '+(I.auto?'checked':'')+'> Sincronizar automáticamente (al guardar y cada 30 s)</label>'+
-  '<div class="row"><button class="btn p">Guardar configuración</button><button type="button" class="btn" data-act="intTest">Probar conexión</button><button type="button" class="btn" data-act="intSync">⟳ Sincronizar ahora</button>'+(I.spreadsheetUrl?'<a class="btn" target="_blank" rel="noopener" href="'+esc(I.spreadsheetUrl)+'">Abrir hoja ↗</a>':'')+'</div></form>'+
-  '<details><summary style="cursor:pointer;font-weight:700">Código del backend (Code.gs) — pasos de instalación</summary><ol class="small muted"><li>Cree una hoja de Google y abra <b>Extensiones → Apps Script</b>.</li><li>Pegue el código, cambie <b>TOKEN</b> por una clave larga y guarde.</li><li><b>Implementar → Nueva implementación → Aplicación web</b>: ejecutar como <i>Yo</i>, acceso <i>Cualquier usuario</i>.</li><li>Copie la URL <code>/exec</code> y el token en el formulario de arriba. Repita en cada dispositivo (o restaure un respaldo).</li></ol>'+
+  '<div class="row"><button class="btn p">Guardar</button><button type="button" class="btn" data-act="intTest">Probar conexión</button><button type="button" class="btn" data-act="intSync">⟳ Sincronizar ahora</button>'+(I.spreadsheetUrl?'<a class="btn" target="_blank" rel="noopener" href="'+esc(I.spreadsheetUrl)+'">Abrir hoja ↗</a>':'')+'</div></form>'+
+  '<details><summary style="cursor:pointer;font-weight:700">Código del backend (Code.gs) — pasos de instalación</summary><ol class="small muted"><li>Cree una hoja de Google y abra <b>Extensiones → Apps Script</b>. Pegue este código y guarde.</li><li>Seleccione la función <b>instalar</b> y pulse <b>Ejecutar</b> (acepte los permisos). Copie la <b>contraseña temporal del admin</b> en <i>Registros de ejecución</i>.</li><li><b>Implementar → Nueva implementación → Aplicación web</b>: ejecutar como <i>Yo</i>, acceso <i>Cualquier usuario</i>.</li><li>Pegue la URL <code>/exec</code> en el campo «Servidor» del login. Los usuarios y contraseñas viven solo en el servidor (hoja oculta <code>_AUTH</code>).</li></ol>'+
   '<div class="row" style="margin-bottom:6px"><button class="btn s" data-act="gasCopy">Copiar código</button><button class="btn s" data-act="gasDl">Descargar Code.gs</button></div><pre class="code">'+esc(GAS_CODE)+'</pre></details></div>'+
   '<div class="card" style="margin-top:14px"><h2 style="margin-bottom:8px">Bitácora de auditoría (últimos 60)</h2><div class="tw" style="max-height:300px"><table><thead><tr><th>Fecha</th><th>Usuario</th><th>Acción</th><th>Detalle</th></tr></thead><tbody>'+
   (S.audit||[]).slice(0,60).map(function(a){return '<tr><td class="small">'+esc(a.t)+'</td><td class="mono">'+esc(a.u)+'</td><td>'+esc(a.a)+'</td><td class="small muted">'+esc(a.d)+'</td></tr>'}).join('')+'</tbody></table></div></div>';
@@ -829,6 +1139,11 @@ function fail(e){toast('error','No se pudo completar la acción',e&&e.message?e.
 /* ===================== EVENTOS ===================== */
 var H={
   nav:function(el){go(el.dataset.v)},
+  loginPing:async function(){var el=$('#lstatus'),i=$('#lsrv'),u=(i&&i.value.trim())||S.integration.url;
+    if(!u){el.textContent='Escriba primero la URL del servidor.';return}
+    S.integration.url=u;save({noSync:true});el.textContent='Probando…';
+    try{var r=await gas('ping',{},true);el.innerHTML='<span style="color:#059669">✔ Servidor alcanzado · versión '+esc(r.version)+'</span><br><span class="muted">Script …'+esc(r.script||'?')+' · Hoja …'+esc(r.hoja||'?')+' · Huella '+esc(r.huella||'?')+' · '+esc(r.usuarios==null?'?':r.usuarios)+' usuario(s)</span>'+(r.instalado?'':'<br><span style="color:#d97706">⚠ Falta ejecutar instalar() en Apps Script (no hay usuarios).</span>')+(r.version!=='4.0'?'<br><span style="color:#d97706">⚠ El servidor no es la versión 4.0: publique una nueva versión del Code.gs.</span>':'')}
+    catch(e){el.innerHTML='<span style="color:#dc2626">✖ '+esc(e.message)+'</span>'}},
   logout:function(){closeModal();logout()},
   togglePw:function(){var p=$('#lp');p.type=p.type==='password'?'text':'password'},
   closeModal:function(){closeModal()},
@@ -871,15 +1186,15 @@ var H={
   expTrace:async function(){await exportXlsx([{name:'Trazabilidad_SKU',rows:S.traceability.map(function(t){return {Fecha:t.fechaRegistro,'ID Inventario':t.idInventario,'Título':t.tituloInventario,SKU:t.sku,Descripción:t.descripcion,'Stock Teórico':t.stockTeorico,'Cantidad Contada':t.cantidadContada,Diferencia:t.diferencia,Clasificación:clsOf(t.diferencia),Responsable:t.responsable,Notas:t.notas||'-'}})}],'Trazabilidad_Historica.xlsx')},
   userModal:function(el){openUserModal(el.dataset.id)},
   userDel:function(el){var u=S.users.find(function(x){return x.id===el.dataset.id});openModal('<h2>Eliminar usuario</h2><p>¿Eliminar a <b>'+esc(u.name)+'</b> ('+esc(u.username)+')? Perderá el acceso de inmediato.</p><div class="row" style="justify-content:flex-end"><button class="btn" data-act="closeModal">Cancelar</button><button class="btn d" data-act="userDelOk" data-id="'+u.id+'">Eliminar</button></div>')},
-  userDelOk:function(el){deleteUser(el.dataset.id);closeModal();toast('info','Usuario eliminado');render()},
+  userDelOk:async function(el){await deleteUser(el.dataset.id);closeModal();toast('info','Usuario eliminado');render()},
   pwModal:function(){openPwModal(false)},
-  intTest:async function(){saveIntForm();try{var r=await gas('test');toast('success','Conexión verificada','Hoja: '+(r.spreadsheetName||'OK'))}catch(e){fail(e)}},
+  intTest:async function(){saveIntForm();try{var r=await gas('ping',{},true);toast('success','Servidor alcanzado','Versión '+r.version+(r.instalado?'':' · ¡falta ejecutar instalar()!'))}catch(e){fail(e)}},
   intSync:async function(){saveIntForm();await syncNow(false);render()},
   gasCopy:async function(){try{await navigator.clipboard.writeText(GAS_CODE);toast('success','Código copiado')}catch(e){toast('warning','No se pudo copiar','Use "Descargar Code.gs".')}},
   gasDl:function(){dl('Code.gs',new Blob([GAS_CODE],{type:'text/plain;charset=utf-8'}))},
-  backup:function(){var b=JSON.parse(JSON.stringify(S));dl('respaldo_stockpulse_'+now().slice(0,10)+'.json',new Blob([JSON.stringify(b)],{type:'application/json'}));audit('respaldo','');save({noSync:true})}
+  backup:function(){var b=JSON.parse(JSON.stringify(persistable(S)));dl('respaldo_stockpulse_'+now().slice(0,10)+'.json',new Blob([JSON.stringify(b)],{type:'application/json'}));audit('respaldo','');save({noSync:true})}
 };
-function saveIntForm(){var I=S.integration;I.url=$('#i_url').value.trim();I.token=$('#i_tok').value;I.auto=$('#i_auto').checked;save({noSync:true})}
+function saveIntForm(){var I=S.integration;I.url=$('#i_url').value.trim();I.auto=$('#i_auto').checked;save({noSync:true})}
 document.addEventListener('click',function(e){
   var el=e.target.closest('[data-act]');if(!el||!H[el.dataset.act])return;
   try{var r=H[el.dataset.act](el,e);if(r&&r.catch)r.catch(fail)}catch(err){fail(err)}
@@ -913,20 +1228,22 @@ async function scanImage(f){
   catch(e){var m=$('#qr-msg');if(m)m.textContent='No se detectó ningún código en la imagen.'}
 }
 function restoreBackup(f){
-  var r=new FileReader();r.onload=function(){try{var j=JSON.parse(r.result);if(!j.users||!j.inventories||!j.company)throw new Error('El archivo no es un respaldo válido.');
-    if(!j.users.some(function(u){return u.role==='ADMIN'&&!u.deleted&&u.active!==false}))throw new Error('El respaldo no contiene un administrador activo.');
-    if(!confirm('Esto reemplazará TODOS los datos actuales por los del respaldo. ¿Continuar?'))return;
-    S=j;S.audit=S.audit||[];S.integration=S.integration||{url:'',token:'',auto:false};var me=S.users.find(function(u){return u.id===session.id});session=me||null;audit('restaurar_respaldo','');save({noSync:true});toast('success','Respaldo restaurado');if(!session){logout()}else render()}catch(e){fail(e)}};
+  var r=new FileReader();r.onload=function(){try{var j=JSON.parse(r.result);if(!j.inventories||!j.company)throw new Error('El archivo no es un respaldo válido.');
+    if(!confirm('Esto reemplazará los inventarios y la trazabilidad locales por los del respaldo (los usuarios viven en el servidor). ¿Continuar?'))return;
+    S.company=j.company;S.inventories=j.inventories;S.traceability=j.traceability||[];audit('restaurar_respaldo','');save();toast('success','Respaldo restaurado');render()}catch(e){fail(e)}};
   r.readAsText(f);
 }
 document.addEventListener('submit',async function(e){
   e.preventDefault();var f=e.target;activity();
   try{
     if(f.id==='loginForm'){
-      var btn=$('button[type=submit]',f);btn.disabled=true;btn.textContent='Verificando…';
+      var btn=$('button[type=submit]',f);if(btn.disabled)return;btn.disabled=true;btn.textContent='Conectando con el servidor…';
+      var slow=setTimeout(function(){if(btn.isConnected)btn.textContent='Esperando respuesta… (la primera vez puede tardar unos segundos)'},5000);
       await new Promise(function(r){setTimeout(r,30)});
-      try{tryLogin($('#lu').value,$('#lp').value);ui.loginErr='';ui.view='dashboard';render();toast('success','Sesión iniciada','Rol: '+ROLES[session.role])}
+      var srv=$('#lsrv');if(srv&&srv.value.trim()&&srv.value.trim()!==S.integration.url){S.integration.url=srv.value.trim();S.integration.auto=true;save({noSync:true})}
+      try{await serverLogin($('#lu').value,$('#lp').value);ui.loginErr='';ui.view='dashboard';render();toast('success','Sesión iniciada','Rol: '+ROLES[session.role]);syncNow(true)}
       catch(err){ui.loginErr=err.message;render()}
+      clearTimeout(slow);
     }else if(f.id==='countForm'){
       var it=f.dataset.item,q=$('#cn_q').value,n=$('#cn_n').value,left;
       if(f.dataset.mode==='recount'){left=saveRecount(ui.invId,it,q,n);toast('success','2do conteo guardado',left?left+' pendientes':'Todos recontados: listo para finalizar')}
@@ -941,12 +1258,12 @@ document.addEventListener('submit',async function(e){
       var st=num($('#r_s').value);ui.stage.rows.push({sku:clean($('#r_sku').value),barcode:clean($('#r_bc').value),descripcion:clean($('#r_d').value),categoriaMarca:clean($('#r_c').value),ubicacion:clean($('#r_u').value),stockTeorico:st.v});closeModal();renderStage()
     }else if(f.id==='userForm'){
       var id=f.dataset.id,d={name:$('#u_nm').value,email:$('#u_em').value,cargo:$('#u_cg').value,role:$('#u_rl').value,password:$('#u_pw').value,mustChange:$('#u_mc').checked};
-      if(id){if($('#u_ac'))d.active=$('#u_ac').checked;if(!d.password)delete d.password;updateUser(id,d);toast('success','Usuario actualizado')}
-      else{d.username=$('#u_un').value;createUser(d);toast('success','Usuario creado',d.username)}
+      if(id){if($('#u_ac'))d.active=$('#u_ac').checked;if(!d.password)delete d.password;await updateUser(id,d);toast('success','Usuario actualizado')}
+      else{d.username=$('#u_un').value;await createUser(d);toast('success','Usuario creado',d.username)}
       closeModal();render();
     }else if(f.id==='pwForm'){
       if($('#pw1').value!==$('#pw2').value)throw new Error('La confirmación no coincide.');
-      changeOwnPassword($('#pw0').value,$('#pw1').value);closeModal();toast('success','Contraseña actualizada');render();
+      await changeOwnPassword($('#pw0').value,$('#pw1').value);closeModal();toast('success','Contraseña actualizada');render();
     }else if(f.id==='coForm'){
       need('settings');S.company.name=clean($('#co_n').value)||S.company.name;S.company.nit=clean($('#co_nit').value);S.company.sedePrincipal=clean($('#co_s').value);audit('editar_empresa','');save();toast('success','Empresa actualizada');render();
     }else if(f.id==='intForm'){
@@ -954,12 +1271,12 @@ document.addEventListener('submit',async function(e){
     }
   }catch(err){fail(err)}
 });
-window.addEventListener('storage',function(e){if(e.key===KEY&&e.newValue){try{S=JSON.parse(e.newValue);if(session){var me=S.users.find(function(u){return u.id===session.id&&!u.deleted&&u.active!==false});if(!me){logout();return}session=me}refreshLive()}catch(x){}}});
+window.addEventListener('storage',function(e){if(e.key===KEY&&e.newValue){try{var u=S.users;S=JSON.parse(e.newValue);S.users=u;refreshLive()}catch(x){}}});
 ['mousemove','keydown','touchstart'].forEach(function(ev){document.addEventListener(ev,activity,{passive:true})});
-setInterval(function(){if(!session)return;try{var j=JSON.parse(sessionStorage.getItem(KEY+'_s'));if(!j||Date.now()-j.last>30*60000){closeModal();ui.loginErr='Sesión cerrada por inactividad.';session=null;sessionStorage.removeItem(KEY+'_s');render()}}catch(e){}},30000);
+setInterval(function(){if(!session)return;try{var j=JSON.parse(stGet('sessionStorage',SK));if(!j||Date.now()-j.last>30*60000){closeModal();ui.loginErr='Sesión cerrada por inactividad.';session=null;stDel('sessionStorage',SK);render()}}catch(e){}},30000);
 document.addEventListener('keydown',function(e){if(e.key==='Escape'&&$('#modal').innerHTML&&!$('#pwForm'))closeModal();
   if(e.target&&e.target.id==='usb'&&e.key==='Enter'){e.preventDefault();var v=e.target.value;e.target.value='';var inv=byId(ui.invId),it=inv&&findByCode(inv,v);if(it)openCountModal(it.idDetalle,'count');else if(v.trim())handleCode(v)}});
-restoreSession();render();
+restoreSession();render();if(session){refreshMe().then(function(){syncNow(true)})}
 
 </script>
 </body>
